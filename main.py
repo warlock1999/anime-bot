@@ -1,99 +1,91 @@
 import logging
 import os
-import easywebdav
-import dropbox
+import re
 import httpx
-from mega import Mega
+import requests
+import asyncio
 from bs4 import BeautifulSoup
-from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler, 
     ConversationHandler, filters, ContextTypes, Defaults, PicklePersistence
 )
 
-# --- IMPORT KEEP_ALIVE ---
 from keep_alive import keep_alive
 
 # Enable logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 # Conversation states
-STORAGE, CLOUD_PROVIDER, CREDENTIALS_1, CREDENTIALS_2 = range(4)
+STORAGE, CLOUD_PROVIDER, CREDENTIALS, FOLDER_SELECT = range(4)
 
-# --- 1. NOTIFICATION & EXPIRY LOGIC ---
+# --- 1. SEEDR API (The Engine) ---
 
-async def expiry_job(context: ContextTypes.DEFAULT_TYPE):
-    """Runs 8 hours after login to delete data."""
-    job = context.job
-    user_id = job.user_id
-    try:
-        await context.bot.send_message(
-            chat_id=job.chat_id,
-            text="⚠️ **Session Expired** ⚠️\n\nYour 8-hour login session has ended. Credentials wiped."
-        )
-    except Exception:
-        pass
+class SeedrAPI:
+    def __init__(self, email=None, password=None):
+        self.base_url = "https://www.seedr.cc/oauth_test/resource.php"
+        self.email = email
+        self.password = password
+        self.token = None
 
-    if user_id in context.application.user_data:
-        del context.application.user_data[user_id]
-        logger.info(f"Wiped data for user {user_id}")
+    def login(self):
+        """Get Access Token."""
+        url = "https://www.seedr.cc/rest/login"
+        data = {'username': self.email, 'password': self.password}
+        try:
+            r = requests.post(url, data=data).json()
+            if 'access_token' in r:
+                self.token = r['access_token']
+                return True
+        except:
+            pass
+        return False
 
-def restart_expiry_timer(user_id, chat_id, context):
-    """Starts 8-hour timer."""
-    if not context.job_queue:
-        return # Timer system offline
+    def get_direct_link(self, magnet):
+        """Adds magnet and waits for the direct download link."""
+        if not self.token and not self.login(): return None
+        
+        # 1. Add Magnet
+        requests.get(f"{self.base_url}?method=add_torrent&access_token={self.token}&torrent_magnet={magnet}")
+        
+        # 2. Poll for file (Wait up to 10 seconds)
+        import time
+        for _ in range(5):
+            time.sleep(2)
+            # Check Root Folder
+            list_url = f"{self.base_url}?method=GetFolder&access_token={self.token}&folder_id=0"
+            r = requests.get(list_url).json()
+            
+            # Check inside folders (Torrents usually create a folder)
+            if 'folders' in r:
+                for folder in r['folders']:
+                    # Look inside this folder
+                    sub_url = f"{self.base_url}?method=GetFolder&access_token={self.token}&folder_id={folder['id']}"
+                    sub_r = requests.get(sub_url).json()
+                    if 'files' in sub_r and sub_r['files']:
+                        # Found the video file!
+                        return sub_r['files'][0]['download_url']
+            
+            # Check if it's a loose file
+            if 'files' in r and r['files']:
+                return r['files'][0]['download_url']
+                
+        return None
 
-    current_jobs = context.job_queue.get_jobs_by_name(f"expiry_{user_id}")
-    for job in current_jobs:
-        job.schedule_removal()
-    
-    context.job_queue.run_once(expiry_job, 28800, chat_id=chat_id, user_id=user_id, name=f"expiry_{user_id}")
+# --- 2. SEARCH & PARSING ---
 
-async def download_notification_job(context: ContextTypes.DEFAULT_TYPE):
-    """Simulates a completed task notification."""
-    job = context.job
-    filename = job.data.get('filename', 'Unknown File')
-    folder = job.data.get('folder', 'General')
-    
-    await context.bot.send_message(
-        chat_id=job.chat_id,
-        text=f"✅ **Task Complete!**\n\nFile: <code>{filename}</code>\nLocation: <code>{folder}</code>",
-        parse_mode='HTML'
-    )
-
-async def simulate_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Test command for notifications."""
-    # 1. Check if user is logged in
-    if not context.user_data.get('configured'):
-        await update.message.reply_text("Please /setup first.")
-        return
-    
-    # 2. Check if JobQueue is active (Fixes the 'not working' issue)
-    if not context.job_queue:
-        await update.message.reply_text("❌ **System Error:** The Timer module is missing.\n\nPlease add `APScheduler` to your requirements.txt file.")
-        return
-
-    await update.message.reply_text("⏳ **Simulating Download...** (I will notify you in 5 seconds)")
-    
-    # 3. Schedule the fake notification
-    context.job_queue.run_once(
-        download_notification_job, 
-        5, 
-        chat_id=update.effective_chat.id, 
-        data={'filename': 'One Piece - 1080.mkv', 'folder': '/Anime/One Piece/'}
-    )
-
-# --- 2. SEARCH (MIRROR ROTATION FIX) ---
+def clean_name(text):
+    """Makes the filename look nice."""
+    # Removes [SubsPlease], (1080p), [Hash]
+    clean = re.sub(r'\[.*?\]', '', text)
+    clean = re.sub(r'\(.*?\)', '', clean)
+    return clean.strip().replace('.mkv', '').replace('.mp4', '')
 
 async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Scrapes Nyaa.si mirrors for magnet links."""
     query = " ".join(context.args)
     if not query:
         await update.message.reply_text("🔎 Usage: `/search One Piece`")
@@ -101,222 +93,174 @@ async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status_msg = await update.message.reply_text(f"🔍 Searching: <b>{query}</b>...", parse_mode='HTML')
     
-    # 3 Mirrors to try if one is blocked
     mirrors = ["https://nyaa.si", "https://nyaa.iss.one", "https://nyaa.land"]
-    
-    # Browser Headers
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36",
-        "Referer": "https://google.com"
-    }
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://google.com"}
 
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
         response = None
-        success_url = ""
-
-        # Try mirrors one by one
         for domain in mirrors:
             try:
-                url = f"{domain}/?f=0&c=0_0&q={query}&s=seeders&o=desc"
-                response = await client.get(url, headers=headers)
-                if response.status_code == 200:
-                    success_url = domain
-                    break
-            except Exception:
-                continue
+                response = await client.get(f"{domain}/?f=0&c=0_0&q={query}&s=seeders&o=desc", headers=headers)
+                if response.status_code == 200: break
+            except: continue
 
     if not response or response.status_code != 200:
-        await status_msg.edit_text("⚠️ **Search Failed.**\nAll mirrors are currently blocking the bot's IP.")
+        await status_msg.edit_text("⚠️ **Search Failed.** Mirrors blocked.")
         return
 
-    # Parse Results
     try:
         soup = BeautifulSoup(response.text, 'html.parser')
         rows = soup.select('tr.default, tr.success')[:5]
 
         if not rows:
-            await status_msg.edit_text(f"❌ No results found on {success_url}.")
+            await status_msg.edit_text("❌ No results found.")
             return
 
-        message = f"<b>Top 5 Results for '{query}':</b>\n\n"
+        message = f"<b>Results for '{query}':</b>\n\n"
         keyboard = []
 
         for i, row in enumerate(rows):
             cols = row.find_all('td')
-            title = cols[1].find('a', class_=lambda x: x != 'comments').text.strip()
+            raw_title = cols[1].find('a', class_=lambda x: x != 'comments').text.strip()
             size = cols[3].text.strip()
             magnet = cols[2].find_all('a')[1]['href']
             
-            short_title = (title[:25] + '..') if len(title) > 25 else title
-            message += f"{i+1}. <b>{short_title}</b> [{size}]\n"
+            # Detect Quality
+            quality = "720p"
+            if "1080" in raw_title: quality = "1080p"
+            elif "4k" in raw_title.lower(): quality = "4K"
             
-            magnet_key = f"magnet_{update.effective_user.id}_{i}"
-            context.user_data[magnet_key] = magnet
-            keyboard.append([InlineKeyboardButton(f"🧲 Magnet {i+1}", callback_data=magnet_key)])
+            display_name = clean_name(raw_title)[:30] # Shorten for display
+            
+            message += f"{i+1}. <b>{display_name}</b>\n   └ 📼 {quality} | 📦 {size}\n"
+            
+            # Store data
+            key = f"dl_{update.effective_user.id}_{i}"
+            context.user_data[key] = {'magnet': magnet, 'name': display_name}
+            
+            # Button
+            keyboard.append([InlineKeyboardButton(f"⬇️ Download {quality}", callback_data=key)])
 
         reply_markup = InlineKeyboardMarkup(keyboard)
         await status_msg.edit_text(message, reply_markup=reply_markup, parse_mode='HTML')
 
     except Exception as e:
         logger.error(f"Search error: {e}")
-        await status_msg.edit_text("⚠️ Error parsing results.")
+        await status_msg.edit_text("⚠️ Parsing Error.")
 
-async def magnet_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- 3. DOWNLOAD HANDLER (THE MAGIC) ---
+
+async def download_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    magnet_key = query.data
-    magnet_link = context.user_data.get(magnet_key)
-    await query.answer()
-    if magnet_link:
-        await query.message.reply_text(f"🧲 <b>Magnet:</b>\n\n<code>{magnet_link}</code>", parse_mode='HTML')
-    else:
-        await query.message.reply_text("⚠️ Link expired.")
-
-async def anime_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = " ".join(context.args)
-    if not query:
-        await update.message.reply_text("ℹ️ Usage: `/info Naruto`")
+    await query.answer("🚀 Fetching Link...")
+    
+    data = context.user_data.get(query.data)
+    if not data:
+        await query.message.reply_text("❌ Session expired. Search again.")
         return
-    url = f"https://api.jikan.moe/v4/anime?q={query}&limit=1"
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-             response = await client.get(url)
-             data = response.json()
-        if data.get('data'):
-            anime = data['data'][0]
-            caption = f"🎬 <b>{anime['title']}</b>\n⭐ {anime.get('score', 'N/A')} | 📺 {anime.get('episodes', '?')} eps\n\n{anime.get('synopsis', '')[:200]}..."
-            await update.message.reply_photo(photo=anime['images']['jpg']['image_url'], caption=caption, parse_mode='HTML')
-        else:
-            await update.message.reply_text("❌ Not found.")
-    except Exception as e:
-        await update.message.reply_text(f"⚠️ Error: {e}")
+    
+    # Check Credentials
+    email = context.user_data.get('seedr_email')
+    password = context.user_data.get('seedr_pass')
+    
+    if not email:
+        await query.message.reply_text("⚠️ **Setup Required**\nRun /setup to connect your account.")
+        return
 
-# --- 3. SETUP & CREDENTIALS ---
+    await query.message.reply_text(f"⏳ **Processing:** `{data['name']}`\nPlease wait while I fetch the direct link...", parse_mode='Markdown')
+    
+    # Get Link
+    seedr = SeedrAPI(email, password)
+    link = seedr.get_direct_link(data['magnet'])
+    
+    if link:
+        # We send the link with HTML formatting
+        # This allows the user's device to handle the "Save As" logic
+        await query.message.reply_text(
+            f"✅ **Download Ready!**\n\n"
+            f"🎬 <b>{data['name']}</b>\n"
+            f"🔗 <a href='{link}'>Click Here to Download</a>\n\n"
+            f"<i>Tip: On PC, right-click and choose 'Save Link As' to pick a folder. On Android, it saves to Downloads.</i>",
+            parse_mode='HTML'
+        )
+    else:
+        await query.message.reply_text("❌ **Error:** Could not generate link. Storage might be full.")
+
+# --- 4. SETUP WIZARD (WITH FOLDER SELECT) ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if context.user_data.get('configured'):
-        await update.message.reply_text("✅ You are logged in.")
-        return ConversationHandler.END
     await update.message.reply_text(
-        "👋 **Anime Assistant Bot**\nSelect Storage:",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("📂 Local", callback_data='local')],
-            [InlineKeyboardButton("☁️ Cloud", callback_data='cloud')]
-        ])
+        "👋 **Anime Bot Setup**\n\n"
+        "To download files, I need to connect to a **Seedr** account (Free).\n"
+        "This acts as the engine to convert Torrents -> Direct Links.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚡ Connect Seedr", callback_data='seedr')]])
+    )
+    return CREDENTIALS
+
+async def ask_creds(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("📧 Enter your **Seedr Email**:")
+    return CREDENTIALS
+
+async def save_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['seedr_email'] = update.message.text
+    await update.message.reply_text("🔑 Enter your **Password**:")
+    return FOLDER_SELECT
+
+async def folder_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Save password
+    context.user_data['seedr_pass'] = update.message.text
+    
+    # Ask for Cloud Folder Preference
+    await update.message.reply_text(
+        "📂 **Cloud Storage Preference**\n\n"
+        "If you use this bot to upload to cloud (Google Drive/MEGA), where should files go?\n\n"
+        "Type a folder path (e.g., `/Anime/One Piece/`) OR type `root` to save in main folder.",
     )
     return STORAGE
 
-async def storage_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == 'local':
-        context.user_data['configured'] = True
-        restart_expiry_timer(update.effective_user.id, update.effective_chat.id, context)
-        await query.edit_message_text("✅ **Local Setup Complete!**")
-        return ConversationHandler.END
+async def finish_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    folder = update.message.text
+    if folder.lower() == 'root':
+        context.user_data['cloud_folder'] = '/'
     else:
-        keyboard = [
-            [InlineKeyboardButton("🔴 MEGA", callback_data='mega')],
-            [InlineKeyboardButton("🔵 Dropbox", callback_data='dropbox')],
-            [InlineKeyboardButton("📢 Telegram", callback_data='telegram')],
-            [InlineKeyboardButton("🌐 WebDAV", callback_data='webdav')]
-        ]
-        await query.edit_message_text("Select Cloud:", reply_markup=InlineKeyboardMarkup(keyboard))
-        return CLOUD_PROVIDER
+        context.user_data['cloud_folder'] = folder
+        
+    context.user_data['configured'] = True
+    await update.message.reply_text("✅ **Setup Complete!**\n\nTry `/search One Piece` to start downloading.")
+    return ConversationHandler.END
 
-async def cloud_provider(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    provider = query.data
-    context.user_data['provider'] = provider
-    
-    prompts = {
-        'mega': "Send **MEGA Email**:",
-        'dropbox': "Send **Dropbox Token**:",
-        'telegram': "Forward a message from your channel:",
-        'webdav': "Send **WebDAV URL**:"
-    }
-    await query.edit_message_text(prompts.get(provider, "Error"))
-    return CREDENTIALS_1
+# --- MAIN ---
 
-async def handle_credentials_1(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    provider = context.user_data.get('provider')
-    text = update.message.text.strip() if update.message.text else ""
-    
-    if provider == 'mega':
-        context.user_data['mega_email'] = text
-        await update.message.reply_text("Send **MEGA Password**:")
-        return CREDENTIALS_2
-    elif provider == 'dropbox':
-        try:
-            dropbox.Dropbox(text).users_get_current_account()
-            context.user_data['configured'] = True
-            restart_expiry_timer(update.effective_user.id, update.effective_chat.id, context)
-            await update.message.reply_text("✅ **Dropbox Connected!**")
-            return ConversationHandler.END
-        except:
-            await update.message.reply_text("❌ Invalid Token. Try again.")
-            return CREDENTIALS_1
-    elif provider == 'telegram':
-        if update.message.forward_from_chat:
-            context.user_data['configured'] = True
-            restart_expiry_timer(update.effective_user.id, update.effective_chat.id, context)
-            await update.message.reply_text("✅ **Channel Linked!**")
-            return ConversationHandler.END
-        else:
-            await update.message.reply_text("❌ Forward a message from the channel.")
-            return CREDENTIALS_1
-    elif provider == 'webdav':
-        context.user_data['webdav_url'] = text
-        await update.message.reply_text("Send **Username**:")
-        return CREDENTIALS_2
-
-async def handle_credentials_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    provider = context.user_data.get('provider')
-    text = update.message.text.strip()
-    
-    if provider == 'mega':
-        try:
-            Mega().login(context.user_data['mega_email'], text)
-            context.user_data['configured'] = True
-            restart_expiry_timer(update.effective_user.id, update.effective_chat.id, context)
-            await update.message.reply_text("✅ **MEGA Connected!**")
-            return ConversationHandler.END
-        except:
-            await update.message.reply_text("❌ Login failed.")
-            return ConversationHandler.END
-    elif provider == 'webdav':
-        if 'webdav_user' not in context.user_data:
-            context.user_data['webdav_user'] = text
-            await update.message.reply_text("Send **Password**:")
-            return CREDENTIALS_2
-        else:
-            context.user_data['webdav_pass'] = text
-            context.user_data['configured'] = True
-            restart_expiry_timer(update.effective_user.id, update.effective_chat.id, context)
-            await update.message.reply_text("✅ **WebDAV Connected!**")
-            return ConversationHandler.END
+async def post_init(application: Application):
+    await application.bot.set_my_commands([
+        BotCommand("start", "Setup Bot"),
+        BotCommand("search", "Find Anime"),
+        BotCommand("disconnect", "Logout"),
+    ])
 
 def main():
     persistence = PicklePersistence(filepath="bot_data.pickle")
-    app = Application.builder().token(TOKEN).persistence(persistence).defaults(Defaults(parse_mode='HTML')).build()
+    app = Application.builder().token(TOKEN).persistence(persistence).post_init(post_init).build()
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start), CommandHandler('setup', start)],
         states={
-            STORAGE: [CallbackQueryHandler(storage_choice)],
-            CLOUD_PROVIDER: [CallbackQueryHandler(cloud_provider)],
-            CREDENTIALS_1: [MessageHandler(filters.TEXT & ~filters.COMMAND | filters.FORWARDED, handle_credentials_1)],
-            CREDENTIALS_2: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_credentials_2)],
+            CREDENTIALS: [
+                CallbackQueryHandler(ask_creds, pattern='seedr'),
+                MessageHandler(filters.TEXT, save_email)
+            ],
+            FOLDER_SELECT: [MessageHandler(filters.TEXT, folder_select)],
+            STORAGE: [MessageHandler(filters.TEXT, finish_setup)],
         },
         fallbacks=[CommandHandler('start', start)],
     )
 
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("search", search_anime))
-    app.add_handler(CommandHandler("info", anime_info))
-    app.add_handler(CommandHandler("simulate", simulate_task))
-    app.add_handler(CallbackQueryHandler(magnet_button, pattern="^magnet_"))
-
+    app.add_handler(CallbackQueryHandler(download_button, pattern="^dl_"))
+    
     keep_alive()
     app.run_polling()
 
