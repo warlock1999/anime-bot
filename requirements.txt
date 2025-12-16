@@ -3,3 +3,5 @@ requests
 beautifulsoup4
 easywebdav
 flask
+mega.py
+dropbox
