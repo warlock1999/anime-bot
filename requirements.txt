@@ -7,3 +7,4 @@ mega.py
 dropbox
 httpx
 APScheduler
+aiofiles
