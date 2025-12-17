@@ -24,7 +24,6 @@ logger = logging.getLogger(__name__)
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 
 # Conversation states
-# Added CLOUD_AUTH_3 specifically for WebDAV Password
 SEEDR_LOGIN, SEEDR_PASS, STORAGE_SELECT, CLOUD_MENU, CLOUD_AUTH_1, CLOUD_AUTH_2, CLOUD_AUTH_3, FOLDER_SELECT = range(8)
 
 # --- 1. API HELPERS ---
@@ -102,7 +101,6 @@ async def storage_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     else:
         context.user_data['storage'] = 'cloud'
-        # Added WebDAV to the menu
         keyboard = [
             [InlineKeyboardButton("🔴 MEGA", callback_data='mega')],
             [InlineKeyboardButton("🔵 Dropbox", callback_data='dropbox')],
@@ -120,12 +118,12 @@ async def cloud_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompts = {
         'mega': "🔴 **MEGA Login**\n\nEnter your **Email**:",
         'dropbox': "🔵 **Dropbox Setup**\n\nEnter your **Access Token**:",
-        'webdav': "🌐 **WebDAV Setup**\n\nEnter your **WebDAV URL** (e.g., https://cloud.example.com/remote.php/dav/files/user/):"
+        'webdav': "⚠️ **Bandwidth Warning** ⚠️\n\nWebDAV uploads go **THROUGH** this bot server. Large files will consume your free tier data limits (e.g. 100GB/mo).\n\nIf you agree, enter your **WebDAV URL**:"
     }
     await query.edit_message_text(prompts.get(provider))
     return CLOUD_AUTH_1
 
-# --- CLOUD AUTHENTICATION STEPS ---
+# --- CLOUD AUTH STEPS ---
 
 async def cloud_auth_1(update: Update, context: ContextTypes.DEFAULT_TYPE):
     provider = context.user_data.get('provider')
@@ -157,7 +155,6 @@ async def cloud_auth_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     
     if provider == 'mega':
-        # MEGA Logic
         try:
             m = Mega()
             m.login(context.user_data['mega_email'], text)
@@ -171,24 +168,16 @@ async def cloud_auth_2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif provider == 'webdav':
         context.user_data['webdav_user'] = text
         await update.message.reply_text("🔑 Enter **WebDAV Password**:")
-        return CLOUD_AUTH_3 # Go to Step 3 for WebDAV
+        return CLOUD_AUTH_3
 
 async def cloud_auth_3(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # This step is specifically for WebDAV Password
     provider = context.user_data.get('provider')
     text = update.message.text.strip()
     
     if provider == 'webdav':
         context.user_data['webdav_pass'] = text
-        
-        # TEST WEBDAV CONNECTION
         msg = await update.message.reply_text("⏳ Testing WebDAV Connection...")
         try:
-            # Clean URL for easywebdav (it expects protocol, host, path separated or specific format)
-            # Simplest way: just try to list root dir
-            # Note: easywebdav is a bit old, using requests is often more robust, but we will try standard init
-            
-            # Extract parts for easywebdav
             url = context.user_data['webdav_url']
             protocol = 'https' if url.startswith('https') else 'http'
             clean_url = url.replace('https://', '').replace('http://', '')
@@ -202,12 +191,11 @@ async def cloud_auth_3(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 username=context.user_data['webdav_user'],
                 password=context.user_data['webdav_pass']
             )
-            webdav.ls() # Try to list directory
-            
+            webdav.ls()
             await msg.edit_text("✅ **WebDAV Connected!**\n\n📂 Enter **Folder Path** (e.g., `/Anime`):")
             return FOLDER_SELECT
         except Exception as e:
-            await msg.edit_text(f"❌ **Connection Failed.**\nError: {str(e)}\n\nCheck your URL and try entering URL again:")
+            await msg.edit_text(f"❌ **Connection Failed.**\nError: {str(e)}\n\nCheck URL and try again:")
             return CLOUD_AUTH_1
 
 async def save_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -248,7 +236,7 @@ async def process_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
         provider = context.user_data.get('provider')
         
         if provider == 'dropbox':
-            await msg.edit_text("☁️ **Sending to Dropbox...**")
+            await msg.edit_text("☁️ **Uploading to Dropbox...**")
             try:
                 dbx = dropbox.Dropbox(context.user_data['dropbox_token'])
                 path = f"{context.user_data['cloud_folder']}/{data['name']}.mkv"
@@ -257,37 +245,92 @@ async def process_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception as e: await msg.edit_text(f"❌ Error: {e}")
 
         elif provider == 'webdav':
-            await msg.edit_text("☁️ **Uploading to WebDAV...**\n(Note: This uses server bandwidth)")
-            # WebDAV Upload Logic (Streaming)
+            await msg.edit_text("☁️ **Streaming to WebDAV...**\n⚠️ *Consuming Server Bandwidth*")
             try:
-                # 1. Download Stream
                 r = requests.get(link, stream=True)
-                # 2. Upload Stream
                 webdav_url = context.user_data['webdav_url']
                 target_url = f"{webdav_url}{context.user_data['cloud_folder']}/{data['name']}.mkv"
-                
-                # Using requests.put to stream data directly
                 requests.put(
                     target_url, 
                     data=r.iter_content(chunk_size=4096), 
                     auth=(context.user_data['webdav_user'], context.user_data['webdav_pass'])
                 )
-                await msg.edit_text("✅ **Upload to WebDAV Complete!**")
+                await msg.edit_text("✅ **WebDAV Upload Complete!**")
             except Exception as e:
-                await msg.edit_text(f"❌ Upload Failed: {e}\nHere is the link instead:\n{link}")
+                await msg.edit_text(f"❌ Upload Failed: {e}\nLink: {link}")
 
-# --- 4. SEARCH (Placeholder logic for integration) ---
+# --- 4. SEARCH & PARSING ---
+
+def clean_name(text):
+    return re.sub(r'\[.*?\]|\(.*?\)', '', text).strip()
+
 async def search_anime(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # (Insert the Search Logic from previous turn here: search Nyaa -> Show buttons)
-    # Ensure button callback is: InlineKeyboardButton("⬇️ Download", callback_data=key)
-    # And key saves to context.user_data
-    await update.message.reply_text("Search functionality active. (Reuse search code block)")
+    query = " ".join(context.args)
+    if not query:
+        await update.message.reply_text("🔎 Usage: `/search One Piece`")
+        return
+
+    status_msg = await update.message.reply_text(f"🔍 Searching: <b>{query}</b>...", parse_mode='HTML')
+    
+    mirrors = ["https://nyaa.si", "https://nyaa.iss.one", "https://nyaa.land"]
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://google.com"}
+
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        response = None
+        for domain in mirrors:
+            try:
+                response = await client.get(f"{domain}/?f=0&c=0_0&q={query}&s=seeders&o=desc", headers=headers)
+                if response.status_code == 200: break
+            except: continue
+
+    if not response or response.status_code != 200:
+        await status_msg.edit_text("⚠️ **Search Failed.** Mirrors blocked.")
+        return
+
+    try:
+        soup = BeautifulSoup(response.text, 'html.parser')
+        rows = soup.select('tr.default, tr.success')[:5]
+
+        if not rows:
+            await status_msg.edit_text("❌ No results found.")
+            return
+
+        message = f"<b>Found {len(rows)} results for '{query}':</b>\n\n"
+        keyboard = []
+
+        for i, row in enumerate(rows):
+            cols = row.find_all('td')
+            raw_title = cols[1].find('a', class_=lambda x: x != 'comments').text.strip()
+            size = cols[3].text.strip()
+            magnet = cols[2].find_all('a')[1]['href']
+            
+            display_name = clean_name(raw_title)[:30]
+            
+            key = f"dl_{update.effective_user.id}_{i}"
+            context.user_data[key] = {'magnet': magnet, 'name': display_name}
+            
+            message += f"{i+1}. <b>{display_name}</b> [{size}]\n"
+            keyboard.append([InlineKeyboardButton(f"⬇️ Download {i+1}", callback_data=key)])
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await status_msg.edit_text(message, reply_markup=reply_markup, parse_mode='HTML')
+
+    except Exception as e:
+        logger.error(f"Search error: {e}")
+        await status_msg.edit_text("⚠️ Parsing Error.")
 
 # --- MAIN ---
 
+async def post_init(application: Application):
+    await application.bot.set_my_commands([
+        BotCommand("start", "Setup Bot"),
+        BotCommand("search", "Find Anime"),
+        BotCommand("disconnect", "Logout"),
+    ])
+
 def main():
     persistence = PicklePersistence(filepath="bot_data.pickle")
-    app = Application.builder().token(TOKEN).persistence(persistence).build()
+    app = Application.builder().token(TOKEN).persistence(persistence).post_init(post_init).build()
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start_setup), CommandHandler('setup', start_setup)],
@@ -298,13 +341,14 @@ def main():
             CLOUD_MENU: [CallbackQueryHandler(cloud_menu)],
             CLOUD_AUTH_1: [MessageHandler(filters.TEXT, cloud_auth_1)],
             CLOUD_AUTH_2: [MessageHandler(filters.TEXT, cloud_auth_2)],
-            CLOUD_AUTH_3: [MessageHandler(filters.TEXT, cloud_auth_3)], # Added Step 3
+            CLOUD_AUTH_3: [MessageHandler(filters.TEXT, cloud_auth_3)],
             FOLDER_SELECT: [MessageHandler(filters.TEXT, save_folder)],
         },
         fallbacks=[CommandHandler('start', start_setup)],
     )
 
     app.add_handler(conv_handler)
+    app.add_handler(CommandHandler("search", search_anime))
     app.add_handler(CallbackQueryHandler(process_download, pattern="^dl_"))
     
     keep_alive()
